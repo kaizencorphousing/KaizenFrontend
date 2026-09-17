@@ -1,281 +1,210 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import { api } from "../api/client";
+import type { User, Favorite } from "../types/database";
 
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import { api, getStoredToken, setStoredToken, removeStoredToken } from '../api/client';
-import { User as DbUser } from '../types/database';
+export type { User };
 
-export interface User extends Partial<DbUser> {
-  id: string | number;
-  name?: string;
-  username?: string;
-  email: string;
-  first_name?: string;
-  last_name?: string;
-  role: any;
-  is_staff?: boolean;
-  is_superuser?: boolean;
-  avatarUrl?: string;
-  company?: string;
-  phone?: string;
-}
-
-interface AuthContextType {
+interface AuthContextValue {
   user: User | null;
-  token: string | null;
-  isAuthenticated: boolean;
-  isLoading: boolean;
-  favorites: string[];
-  login: (email: string, password?: string) => Promise<User | null>;
+  loading: boolean;
+  login: (email: string, password: string) => Promise<User>;
+  register: (data: {
+    username: string;
+    email?: string;
+    password: string;
+    first_name?: string;
+    last_name?: string;
+  }) => Promise<User>;
   logout: () => Promise<void>;
-  updateProfile: (data: Partial<User>) => Promise<void>;
-  toggleFavorite: (propertyId: string | number) => Promise<boolean>;
+  favorites: Favorite[];
+  favoritesLoading: boolean;
   isFavorite: (propertyId: string | number) => boolean;
-  refreshFavorites: () => Promise<void>;
+  toggleFavorite: (propertyId: string | number, propertySnapshot?: any) => Promise<void>;
 }
 
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
+const AuthContext = createContext<AuthContextValue | null>(null);
 
-const normalizeUser = (u: any): User => {
-  if (!u) return u;
-  const name = u.name || (u.first_name || u.last_name ? `${u.first_name || ''} ${u.last_name || ''}`.trim() : u.username || u.email);
-  return {
-    ...u,
-    id: u.id,
-    email: u.email,
-    name,
-    username: u.username || u.email,
-    role: u.role || (u.is_staff ? 'admin' : 'customer'),
-  };
-};
-
-const extractFavoriteIds = (favRes: any): string[] => {
-  if (!favRes) return [];
-  if (Array.isArray(favRes)) {
-    return favRes.map((f: any) => String(f.property?.id || f.id || f));
-  }
-  if (favRes.favoriteIds && Array.isArray(favRes.favoriteIds)) {
-    return favRes.favoriteIds.map((id: any) => String(id));
-  }
-  if (favRes.favorites && Array.isArray(favRes.favorites)) {
-    return favRes.favorites.map((f: any) => String(f.property?.id || f.id || f));
-  }
-  return [];
-};
-
-export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
+  children,
+}) => {
   const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(getStoredToken());
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [favorites, setFavorites] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [favorites, setFavorites] = useState<Favorite[]>([]);
+  const [favoritesLoading, setFavoritesLoading] = useState(false);
 
-  // Load user profile on mount if token exists
-  useEffect(() => {
-    const initAuth = async () => {
-      const storedToken = getStoredToken();
-      if (storedToken) {
-        if (storedToken === 'mock_admin_jwt_token' || storedToken.startsWith('mock_')) {
-          const mockAdminUser: User = {
-            id: 'admin_1',
-            email: 'admin@kaizen.com',
-            name: 'Kaizen Administrator',
-            username: 'admin',
-            role: 'admin',
-            is_staff: true,
-            is_superuser: true,
-            avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
-            company: 'Kaizen Luxury Estates',
-          };
-          setUser(mockAdminUser);
-          setToken(storedToken);
-          setIsLoading(false);
-          return;
-        }
-
-        try {
-          const res: any = await api.getUserProfile();
-          const rawUser = res?.user || (res?.email || res?.id ? res : null);
-          const userObj = rawUser ? normalizeUser(rawUser) : null;
-          if (userObj) {
-            setUser(userObj);
-            setToken(storedToken);
-            // Load favorites
-            const favRes = await api.getFavorites().catch(() => []);
-            setFavorites(extractFavoriteIds(favRes));
-          } else {
-            removeStoredToken();
-            setToken(null);
-          }
-        } catch (err) {
-          console.warn('Failed to restore session:', err);
-          removeStoredToken();
-          setToken(null);
-        }
-      }
-      setIsLoading(false);
-    };
-
-    initAuth();
+  const loadFavorites = useCallback(async () => {
+    setFavoritesLoading(true);
+    try {
+      const list = await api.getFavorites();
+      setFavorites(list);
+    } catch {
+      setFavorites([]);
+    } finally {
+      setFavoritesLoading(false);
+    }
   }, []);
 
-  const login = async (email: string, password?: string): Promise<User | null> => {
-    setIsLoading(true);
-    const cleanEmail = email.trim().toLowerCase();
-    const isAdminCreds = (cleanEmail === 'admin' || cleanEmail === 'admin@kaizen.com') &&
-      (!password || password === 'admin123' || password === 'admin' || password === 'kaizen2026');
+  useEffect(() => {
+    let cancelled = false;
 
-    try {
-      const res: any = await api.login({ email, password });
-      const rawUser = res?.user || (res?.email || res?.id ? res : null);
-      const userObj = rawUser ? normalizeUser(rawUser) : null;
-      if (res?.token && userObj) {
-        setStoredToken(res.token);
-        setToken(res.token);
-        setUser(userObj);
-
-        // Fetch favorites after login
-        const favRes = await api.getFavorites().catch(() => []);
-        setFavorites(extractFavoriteIds(favRes));
-        return userObj;
+    (async () => {
+      const restored = await api.restoreSession();
+      if (cancelled) return;
+      if (!restored) {
+        setLoading(false);
+        return;
       }
-    } catch (err) {
-      if (isAdminCreds) {
-        // Fallback to mock admin session on Vercel/demo deployments where backend API is offline
-        const mockAdminUser: User = {
-          id: 'admin_1',
-          email: 'admin@kaizen.com',
-          name: 'Kaizen Administrator',
-          username: 'admin',
-          role: 'admin',
-          is_staff: true,
-          is_superuser: true,
-          avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
-          company: 'Kaizen Luxury Estates',
-        };
-        const mockToken = 'mock_admin_jwt_token';
-        setStoredToken(mockToken);
-        setToken(mockToken);
-        setUser(mockAdminUser);
-        return mockAdminUser;
-      }
-      throw err;
-    } finally {
-      setIsLoading(false);
-    }
-
-    if (isAdminCreds) {
-      const mockAdminUser: User = {
-        id: 'admin_1',
-        email: 'admin@kaizen.com',
-        name: 'Kaizen Administrator',
-        username: 'admin',
-        role: 'admin',
-        is_staff: true,
-        is_superuser: true,
-        avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
-        company: 'Kaizen Luxury Estates',
-      };
-      const mockToken = 'mock_admin_jwt_token';
-      setStoredToken(mockToken);
-      setToken(mockToken);
-      setUser(mockAdminUser);
-      return mockAdminUser;
-    }
-
-    return null;
-  };
-
-  const logout = async () => {
-    setIsLoading(true);
-    try {
-      await api.logout().catch(() => {});
-    } finally {
-      removeStoredToken();
-      setToken(null);
-      setUser(null);
-      setFavorites([]);
-      setIsLoading(false);
-    }
-  };
-
-  const updateProfile = async (data: Partial<User>) => {
-    const res: any = await api.updateUserProfile(data);
-    const rawUser = res?.user || (res?.email || res?.id ? res : null);
-    const userObj = rawUser ? normalizeUser(rawUser) : null;
-    if (userObj) {
-      setUser(userObj);
-    }
-  };
-
-  const refreshFavorites = async () => {
-    if (!token) return;
-    try {
-      const res = await api.getFavorites();
-      setFavorites(extractFavoriteIds(res));
-    } catch (err) {
-      console.warn('Failed to fetch favorites:', err);
-    }
-  };
-
-  const toggleFavorite = async (propertyId: string | number): Promise<boolean> => {
-    if (!token || !user) {
-      throw new Error('Please login to save properties to your favorites.');
-    }
-
-    const strId = String(propertyId);
-    const exists = favorites.includes(strId);
-    if (exists) {
-      setFavorites((prev) => prev.filter((id) => id !== strId));
       try {
-        const res = await api.removeFavorite(strId);
-        if (res) setFavorites(extractFavoriteIds(res));
-        return false;
-      } catch (err) {
-        setFavorites((prev) => [...prev, strId]); // revert
-        throw err;
+        const profile = await api.getUserProfile();
+        if (!cancelled) {
+          setUser(profile);
+          loadFavorites();
+        }
+      } catch {
+        if (!cancelled) setUser(null);
+      } finally {
+        if (!cancelled) setLoading(false);
       }
-    } else {
-      setFavorites((prev) => [...prev, strId]);
-      try {
-        const res = await api.addFavorite(strId);
-        if (res) setFavorites(extractFavoriteIds(res));
-        return true;
-      } catch (err) {
-        setFavorites((prev) => prev.filter((id) => id !== strId)); // revert
-        throw err;
+    })();
+
+    // When the refresh token is rejected (401 on /api/token/refresh/),
+    // http.ts fires this event — we react by clearing user state.
+    const handleSessionExpired = () => {
+      if (!cancelled) {
+        setUser(null);
+        setFavorites([]);
       }
-    }
-  };
+    };
+    window.addEventListener("kaizen:session-expired", handleSessionExpired);
 
-  const isFavorite = (propertyId: string | number) => favorites.includes(String(propertyId));
+    return () => {
+      cancelled = true;
+      window.removeEventListener(
+        "kaizen:session-expired",
+        handleSessionExpired,
+      );
+    };
+  }, [loadFavorites]);
 
-  return (
-    <AuthContext.Provider
-      value={{
-        user,
-        token,
-        isAuthenticated: !!user,
-        isLoading,
-        favorites,
-        login,
-        logout,
-        updateProfile,
-        toggleFavorite,
-        isFavorite,
-        refreshFavorites,
-      }}
-    >
-      {children}
-    </AuthContext.Provider>
+  const login = useCallback(
+    async (email: string, password: string) => {
+      const loggedInUser = await api.login({ email, password });
+      setUser(loggedInUser);
+      loadFavorites();
+      return loggedInUser;
+    },
+    [loadFavorites],
   );
+
+  const register = useCallback(
+    async (data: {
+      username: string;
+      email?: string;
+      password: string;
+      first_name?: string;
+      last_name?: string;
+    }) => {
+      const newUser = await api.register(data);
+      setUser(newUser);
+      loadFavorites();
+      return newUser;
+    },
+    [loadFavorites],
+  );
+
+  const logout = useCallback(async () => {
+    await api.logout();
+    setUser(null);
+    setFavorites([]);
+  }, []);
+
+  const isFavorite = useCallback(
+    (propertyId: string | number) =>
+      favorites.some((f) => String(f.property.id) === String(propertyId)),
+    [favorites],
+  );
+
+  const toggleFavorite = useCallback(
+    async (propertyId: string | number, propertySnapshot?: any) => {
+      const currentlyFavorite = favorites.some(
+        (f) => String(f.property.id) === String(propertyId),
+      );
+
+      if (currentlyFavorite) {
+        const snapshot = favorites;
+        setFavorites((prev) =>
+          prev.filter((f) => String(f.property.id) !== String(propertyId)),
+        );
+        try {
+          await api.removeFavorite(propertyId);
+        } catch (err) {
+          console.error("Failed to remove favorite:", err);
+          setFavorites(snapshot); // rollback
+        }
+      } else {
+        const snapshot = favorites;
+        const optimisticEntry = {
+          id: `temp-${propertyId}`,
+          property: propertySnapshot ?? { id: propertyId },
+          created_at: new Date().toISOString(),
+        } as any;
+        setFavorites((prev) => [...prev, optimisticEntry]); // instant heart fill
+
+        try {
+          const created = await api.addFavorite(propertyId);
+          if (created && typeof created === "object" && "property" in created) {
+            setFavorites((prev) =>
+              prev.map((f) => (f.id === optimisticEntry.id ? created : f)),
+            );
+          } else {
+            await loadFavorites(); // backend said "already favorited" — resync
+          }
+        } catch (err) {
+          console.error("Failed to add favorite:", err);
+          setFavorites(snapshot); // rollback
+        }
+      }
+    },
+    [favorites, loadFavorites],
+  );
+
+  const value = useMemo(
+    () => ({
+      user,
+      loading,
+      login,
+      register,
+      logout,
+      favorites,
+      favoritesLoading,
+      isFavorite,
+      toggleFavorite,
+    }),
+    [
+      user,
+      loading,
+      login,
+      register,
+      logout,
+      favorites,
+      favoritesLoading,
+      isFavorite,
+      toggleFavorite,
+    ],
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
 
-export const useAuth = () => {
-  const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error('useAuth must be used within an AuthProvider');
-  }
-  return context;
-};
+export function useAuth(): AuthContextValue {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be used within an AuthProvider");
+  return ctx;
+}
